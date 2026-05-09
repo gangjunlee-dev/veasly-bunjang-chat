@@ -288,7 +288,7 @@ function parseFirestoreValue(val: any): any {
 
 // ── 채팅 채널 조회 (Firestore) ──
 async function fetchChatChannels(uid: string, idToken: string): Promise<any[]> {
-  const url = `${FIRESTORE_BASE}/users/${uid}/channels?orderBy=last_messaged_at%20desc&pageSize=30`
+  const url = `${FIRESTORE_BASE}/users/${uid}/channels?orderBy=last_messaged_at%20desc&pageSize=100`
   const resp = await fetch(url, {
     headers: {
       'Authorization': `Bearer ${idToken}`,
@@ -360,8 +360,7 @@ async function fetchTalkMessages(
     created_at: m.createdAt || m.created_at || '',
     sender_id: String(m.uid || m.senderId || m.sender_id || ''),
   })).filter((m: ParsedMessage) => m.content !== '')
-
-  parsed.reverse()
+  parsed.sort((a: ParsedMessage, b: ParsedMessage) => (a.created_at || '').localeCompare(b.created_at || ''))
   return parsed
 }
 
@@ -446,6 +445,12 @@ async function sendSlack(webhookUrl: string, text: string): Promise<boolean> {
 }
 
 // ── 알림 전송 (텔레그램 + 슬랙 동시) ──
+function escapeHtml(s: string): string {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
 async function sendNotifications(
   config: MonitorConfig,
   label: string,
@@ -453,7 +458,7 @@ async function sendNotifications(
   message: string,
   errors: string[]
 ): Promise<void> {
-  const telegramText = `<b>[번개장터 ${label}]</b>\nFrom: <b>${nickname}</b>\n${message.slice(0, 200)}`
+  const telegramText = `<b>[번개장터 ${escapeHtml(label)}]</b>\nFrom: <b>${escapeHtml(nickname)}</b>\n${escapeHtml(message.slice(0, 200))}`
   const slackText = `*[번개장터 ${label}]*\nFrom: *${nickname}*\n${message.slice(0, 200)}`
 
   if (config.telegram_bot_token && config.telegram_chat_id) {
@@ -562,7 +567,21 @@ export async function monitor(kv: KVNamespace): Promise<MonitorResult> {
   // 4. 상태 로드
   const state: ChatState = (await kv.get('chat_state', 'json')) || { known: {}, last_poll: '' } as any
   const nicknameCache: Record<string, string> = (await kv.get('nickname_cache', 'json')) || {}
-  const ignoreKeywords: string[] = config.ignore_keywords || ['결제가 완료되었어요', '상품 준비중']
+  const ignoreKeywords: string[] = config.ignore_keywords || [
+    '결제가 완료되었어요',
+    '상품 준비중',
+    '구매확정을 꼭 진행해 주세요',
+    '배송이 완료',
+    '운송장 번호가 등록되었어요',
+    '운송장 번호가 수정되었어요',
+    '거래가 완료',
+    '거래가 취소되었어요',
+    '후기가 도착했어요',
+    '구매확정이 완료될 예정이에요',
+    '사진과 상품 설명이 수정되었어요',
+    '상품 설명이 수정되었어요',
+    '상품 정보가 변경되었어요',
+  ]
 
   const isFirstRun = Object.keys(state.known).length === 0
   const myUid = config.firebase_uid!
@@ -652,10 +671,10 @@ export async function monitor(kv: KVNamespace): Promise<MonitorResult> {
           })
           result.new_messages++
         }
-
-        const latestMsgId = messages[0].id
-        const latestMsgTs = messages[0].created_at || ''
-        const latestSenderId = messages[0].sender_id
+        const latest = messages[messages.length - 1]
+        const latestMsgId = latest?.id || ''
+        const latestMsgTs = latest?.created_at || ''
+        const latestSenderId = latest?.sender_id || ''
         state.known[cid] = {
           msg: lastMsg, ts: lastTs,
           last_msg_id: latestMsgId, last_msg_ts: latestMsgTs,

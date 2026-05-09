@@ -4,3 +4,18 @@ dist/
 *.backup
 *.zip
 *.tar.gz
+backup-before-*/
+patch-*.ps1
+hotfix-*.ps1
+fix-failed-safe-patch.ps1
+patch-run-log.txt
+
+# Local patch/backups
+backup-before-*/
+backup-*/
+patch-*.ps1
+hotfix-*.ps1
+*-hotfix-*.ps1
+patch-run-log.txt
+.wrangler/
+dist/

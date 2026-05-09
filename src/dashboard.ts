@@ -148,7 +148,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       <div class="sb-actions">
         <button class="sb-btn" onclick="triggerPoll(this)"><i class="fas fa-sync-alt"></i>폴링</button>
         <button class="sb-btn" onclick="loadAll()"><i class="fas fa-redo"></i>새로고침</button>
-        <button class="sb-btn" onclick="resetState()"><i class="fas fa-trash-alt"></i>초기화</button>
+        <button class="sb-btn" disabled title="데이터 보호를 위해 초기화가 비활성화되었습니다" style="opacity:.45;cursor:not-allowed"><i class="fas fa-lock"></i>초기화 잠금</button>
       </div>
     </div>
 
@@ -358,9 +358,25 @@ let G = {
   activeChannel: null, activeOtherUid: null, activeNickname: '', msgPollTimer: null,
   filterMode: 'reply', // 'reply' = 답장 필요만, 'all' = 전체 보기
   searchQuery: '',
+  serverSearchMode: false, searchMeta: null,
 };
 
 // ══════════ API ══════════
+function isProductSearchQuery(q) {
+  if (!q) return false;
+  var text = String(q).trim();
+  return /\/products\/\d+/.test(text) || /^\d{6,15}$/.test(text);
+}
+
+function buildSearchApiUrl(q) {
+  var text = String(q || '').trim();
+
+  if (isProductSearchQuery(text)) {
+    return '/api/deep-search-chats?q=' + encodeURIComponent(text) + '&limit=91&message_limit=100&fetch_limit=40&offset=0';
+  }
+
+  return '/api/search-chats?q=' + encodeURIComponent(text) + '&limit=300';
+}
 async function api(path, opts={}) {
   const r = await fetch(API + path, { ...opts, headers: { 'Content-Type':'application/json', ...(opts.headers||{}) }});
   return r.json();
@@ -403,8 +419,10 @@ async function loadStatus() {
 // ══════════ CHAT LIST ══════════
 async function loadChats() {
   try {
-    const data = await api('/api/recent-chats');
+    const data = await api('/api/recent-chats?limit=300');
     if (!data.ok) return;
+    G.serverSearchMode = false;
+    G.searchMeta = null;
     G.chats = data.chats || [];
     G.myUid = data.my_uid || G.myUid;
     G.replyEnabled = data.reply_enabled;
@@ -414,11 +432,190 @@ async function loadChats() {
 }
 
 // ── 검색 ──
-function onSearch() {
+window.onSearch = function() {
   G.searchQuery = (document.getElementById('search-input').value || '').trim().toLowerCase();
   renderChatList();
 }
 
+// ── 서버사이드 검색: 현재 채팅 + 아카이브까지 검색 ──
+// 기존 onSearch 함수보다 뒤에 선언하여 동일 이름 함수를 덮어쓴다.
+window.onSearch = function() {
+  G.searchQuery = (document.getElementById('search-input').value || '').trim().toLowerCase();
+
+  // 검색 시에는 "답장 필요만" 필터 때문에 결과가 숨겨지지 않도록 전체 보기로 자동 전환
+  if (G.searchQuery && G.filterMode === 'reply') {
+    G.filterMode = 'all';
+    document.getElementById('chip-reply').className = 'filter-chip';
+    document.getElementById('chip-all').className = 'filter-chip active';
+  }
+
+  if (window.__searchTimer) clearTimeout(window.__searchTimer);
+
+  if (!G.searchQuery) {
+    loadChats();
+    return;
+  }
+
+  window.__searchTimer = setTimeout(runServerSearch, 250);
+  renderChatList();
+}
+
+async function runServerSearch() {
+  try {
+    const rawInput = (document.getElementById('search-input').value || '').trim();
+    const inputValue = rawInput.toLowerCase();
+
+    if (!inputValue) {
+      G.serverSearchMode = false;
+      G.searchMeta = null;
+      await loadChats();
+      return;
+    }
+
+    // 상품번호/상품 URL은 3구간 자동 딥서치
+    if (isProductSearchQuery(rawInput)) {
+      const area = document.getElementById('chat-list-area');
+      const countEl = document.getElementById('filter-count');
+
+      G.serverSearchMode = true;
+      G.searchMeta = {
+        type: 'product_deep_search',
+        query: rawInput,
+        scanned: 0,
+        fetched: 0,
+        matches: 0
+      };
+
+      const offsets = [0, 40, 80];
+      const merged = {};
+      let totalFetched = 0;
+      let totalTargets = 0;
+      let totalScanned = 0;
+      let totalErrors = [];
+
+      area.innerHTML =
+        '<div class="no-results">' +
+        '<i class="fas fa-spinner fa-spin"></i>' +
+        '<div style="font-weight:700;color:#475569">상품번호 딥서치 중...</div>' +
+        '<div style="font-size:12px;margin-top:6px">최근 채팅방과 메시지를 확인하고 있습니다.</div>' +
+        '</div>';
+
+      for (let i = 0; i < offsets.length; i++) {
+        const offset = offsets[i];
+
+        area.innerHTML =
+          '<div class="no-results">' +
+          '<i class="fas fa-spinner fa-spin"></i>' +
+          '<div style="font-weight:700;color:#475569">상품번호 딥서치 중...</div>' +
+          '<div style="font-size:12px;margin-top:6px">구간 ' + (i + 1) + '/3 · offset=' + offset + '</div>' +
+          '<div style="font-size:11px;margin-top:4px;color:#94a3b8">검색어: ' + esc(rawInput) + '</div>' +
+          '</div>';
+
+        const url =
+          '/api/deep-search-chats?q=' +
+          encodeURIComponent(rawInput) +
+          '&limit=91&message_limit=100&fetch_limit=40&offset=' +
+          offset;
+
+        const data = await api(url);
+
+        const currentValue = (document.getElementById('search-input').value || '').trim();
+        if (currentValue !== rawInput) return;
+
+        if (data && data.ok) {
+          totalFetched += Number(data.fetched_channels || 0);
+          totalTargets += Number(data.fetch_targets || 0);
+          totalScanned = Math.max(totalScanned, Number(data.scanned_channels || 0));
+
+          if (Array.isArray(data.errors)) {
+            totalErrors = totalErrors.concat(data.errors);
+          }
+
+          (data.chats || []).forEach(function(c) {
+            const key = c.channel_id || c.other_id || (c.nickname + ':' + c.last_time);
+            merged[key] = c;
+          });
+        }
+      }
+
+      const results = Object.keys(merged).map(function(k) { return merged[k]; });
+
+      G.chats = results;
+      G.searchQuery = inputValue;
+      G.serverSearchMode = true;
+      G.searchMeta = {
+        type: 'product_deep_search',
+        query: rawInput,
+        scanned: totalScanned,
+        fetched: totalFetched,
+        targets: totalTargets,
+        matches: results.length,
+        errors: totalErrors
+      };
+
+      if (countEl) {
+        countEl.textContent =
+          '딥서치 ' + totalFetched + '개 확인 · 결과 ' + results.length + '개';
+      }
+
+      if (!results.length) {
+        area.innerHTML =
+          '<div class="no-results">' +
+          '<i class="fas fa-search"></i>' +
+          '<div style="font-weight:800;color:#475569;margin-bottom:6px">상품번호 검색 결과 없음</div>' +
+          '<div style="font-size:12px;line-height:1.8;color:#64748b">' +
+          '검색어: <strong>' + esc(rawInput) + '</strong><br>' +
+          '확인 범위: 최근 채팅방 ' + totalScanned + '개<br>' +
+          '메시지 조회: ' + totalFetched + '개 채팅방<br>' +
+          '각 방 최근 메시지 최대 100개<br>' +
+          '</div>' +
+          '<div style="font-size:12px;margin-top:10px;color:#f97316;font-weight:700">' +
+          '현재 저장된 채팅 데이터 안에는 해당 상품번호/URL이 없습니다.' +
+          '</div>' +
+          '<div style="font-size:11px;margin-top:6px;color:#94a3b8">' +
+          '상품명, 구매자 닉네임, 판매자명으로 다시 검색해보세요.' +
+          '</div>' +
+          '</div>';
+        return;
+      }
+
+      renderChatList();
+      return;
+    }
+
+    // 일반 검색은 서버 검색 API 사용
+    const data = await api('/api/search-chats?q=' + encodeURIComponent(inputValue) + '&limit=300');
+    if (!data.ok) return;
+
+    const currentValue = (document.getElementById('search-input').value || '').trim().toLowerCase();
+    if (currentValue !== inputValue) return;
+
+    G.serverSearchMode = true;
+    G.searchMeta = {
+      type: 'normal_search',
+      query: rawInput,
+      matches: (data.chats || []).length
+    };
+
+    G.chats = data.chats || [];
+    G.myUid = data.my_uid || G.myUid;
+    G.replyEnabled = data.reply_enabled;
+    G.ignoreKeywords = data.ignore_keywords || G.ignoreKeywords || [];
+
+    renderChatList();
+  } catch(e) {
+    console.error(e);
+    const area = document.getElementById('chat-list-area');
+    if (area) {
+      area.innerHTML =
+        '<div class="no-results">' +
+        '<i class="fas fa-exclamation-triangle"></i>' +
+        '<div style="font-weight:700;color:#dc2626">검색 중 오류가 발생했습니다</div>' +
+        '<div style="font-size:12px;margin-top:6px;color:#94a3b8">' + esc(e.message || String(e)) + '</div>' +
+        '</div>';
+    }
+  }
+}
 // ── 필터 토글 ──
 function toggleFilter(mode) {
   G.filterMode = mode;
@@ -439,7 +636,7 @@ function renderChatList() {
   let visible = G.chats;
 
   // 검색어 필터
-  if (G.searchQuery) {
+  if (G.searchQuery && !G.serverSearchMode) {
     visible = visible.filter(c => {
       const nick = (c.nickname||'').toLowerCase();
       const uid = (c.other_id||'').toLowerCase();
@@ -483,7 +680,7 @@ function renderChatList() {
     if (needsReply) badges += '<span class="reply-badge">답장 필요</span>';
     if (isFiltered) badges += '<span class="filtered-badge">필터</span>';
 
-    return '<div class="'+cls+'" onclick="openChat(\\''+esc(c.channel_id)+'\\',\\''+esc(c.other_id)+'\\',\\''+escA(c.nickname)+'\\')">'+
+    return '<div class="'+cls+'" data-channel-id="'+escA(c.channel_id)+'" data-other-id="'+escA(c.other_id)+'" data-nickname="'+escA(c.nickname)+'" onclick="openChat(this.dataset.channelId,this.dataset.otherId,this.dataset.nickname)">'+
       '<div class="chat-avatar'+(isFiltered?' filtered-av':'')+'">'+escH(init)+'</div>'+
       '<div class="chat-meta">'+
         '<div><span class="chat-name">'+escH(c.nickname)+'</span><span class="chat-uid">'+escH(c.other_id)+'</span></div>'+
@@ -611,7 +808,7 @@ async function sendMessage() {
       el.innerHTML += '<div class="msg-row mine"><div class="msg-bubble">'+escH(msg)+'</div><div class="msg-time">'+timeStr+'</div></div>';
       el.scrollTop = el.scrollHeight;
       setTimeout(() => { loadMessages(G.activeChannel, true); loadChats(); }, 2000);
-    } else {
+
       alert(res.error || '전송 실패');
     }
   } catch(e) { alert('네트워크 오류'); }
@@ -732,3 +929,15 @@ setInterval(() => { loadStatus(); loadChats(); }, 30000);
 </script>
 </body>
 </html>`;
+
+
+
+
+
+
+
+
+
+
+
+

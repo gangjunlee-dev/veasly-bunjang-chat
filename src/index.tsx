@@ -26,6 +26,10 @@ app.use('/api/*', cors({
 }))
 
 // ── 웹 대시보드 ──
+
+app.get('/favicon.ico', (c) => {
+  return new Response(null, { status: 204 })
+})
 app.get('/', (c) => {
   return c.html(DASHBOARD_HTML)
 })
@@ -299,12 +303,722 @@ app.get('/api/messages/:channelId', async (c) => {
   })
 })
 
+// 서버사이드 채팅 검색: 현재 채팅 + 아카이브까지 검색
+app.get('/api/search-chats', async (c) => {
+  const qRaw = c.req.query('q') || ''
+  const q = qRaw.trim().toLowerCase()
+
+  const requestedLimit = Number(c.req.query('limit') || '300')
+  const limit = Math.min(Math.max(Number.isFinite(requestedLimit) ? requestedLimit : 300, 1), 500)
+
+  const state: any = await c.env.MONITOR_KV.get('chat_state', 'json') || { known: {} }
+  const archive: any = await c.env.MONITOR_KV.get('chat_state_archive', 'json') || {}
+  const nicknameCache: any = await c.env.MONITOR_KV.get('nickname_cache', 'json') || {}
+  const config: any = await c.env.MONITOR_KV.get('config', 'json') || {}
+
+  const ignoreKeywords: string[] = config.ignore_keywords || []
+  const myUid = config.firebase_uid || ''
+
+  const toChat = (channelId: string, data: any, archived: boolean) => {
+    const parts = channelId.split('_')
+    const otherId = String(data?.other_id || parts.find((p: string) => p !== myUid) || parts[0] || '')
+    const lastMsg = String(data?.msg || '')
+
+    const isFiltered = ignoreKeywords.length > 0 && ignoreKeywords.some((kw: string) => lastMsg.includes(kw))
+    const isMyLastMsg = String(data?.sender_id || '') === String(myUid)
+    const needsReply = !isFiltered && !isMyLastMsg && lastMsg !== ''
+
+    return {
+      channel_id: channelId,
+      other_id: otherId,
+      nickname: nicknameCache[otherId] || otherId,
+      last_message: lastMsg,
+      last_time: data?.ts || '',
+      sender_id: data?.sender_id || '',
+      is_filtered: isFiltered,
+      needs_reply: needsReply,
+      archived,
+    }
+  }
+
+  // archive 먼저 넣고, 현재 state가 있으면 현재 데이터로 덮어쓴다.
+  const merged = new Map<string, any>()
+
+  for (const [channelId, data] of Object.entries(archive || {})) {
+    merged.set(channelId, toChat(channelId, data, true))
+  }
+
+  for (const [channelId, data] of Object.entries(state.known || {})) {
+    merged.set(channelId, toChat(channelId, data, false))
+  }
+
+  let chats = Array.from(merged.values())
+
+  if (q) {
+    chats = chats.filter((chat: any) => {
+      const haystack = [
+        chat.channel_id,
+        chat.other_id,
+        chat.nickname,
+        chat.last_message,
+      ].join(' ').toLowerCase()
+
+      return haystack.includes(q)
+    })
+  }
+
+  chats = chats
+    .sort((a: any, b: any) => (b.last_time || '').localeCompare(a.last_time || ''))
+    .slice(0, limit)
+
+  return c.json({
+    ok: true,
+    query: qRaw,
+    count: chats.length,
+    chats,
+    reply_enabled: !!config.bun_auth_token,
+    my_uid: myUid,
+    ignore_keywords: ignoreKeywords,
+  })
+})
 // 최근 채팅 목록 (답장 UI용)
+
+// 상품 URL / 상품번호로 채팅방 찾기
+app.get('/api/find-chat-by-product', async (c) => {
+  try {
+    const urlParam = c.req.query('url') || ''
+    const productIdParam = c.req.query('product_id') || c.req.query('pid') || ''
+    const limitRaw = parseInt(c.req.query('limit') || '300', 10)
+    const limit = Math.min(Math.max(isNaN(limitRaw) ? 300 : limitRaw, 1), 500)
+
+    const extractProductId = (input: string): string => {
+      if (!input) return ''
+      const decoded = decodeURIComponent(input)
+      const fromUrl = decoded.match(/\/products\/(\d+)/)
+      if (fromUrl && fromUrl[1]) return fromUrl[1]
+      const numeric = decoded.match(/\b(\d{6,15})\b/)
+      if (numeric && numeric[1]) return numeric[1]
+      return ''
+    }
+
+    const productId = extractProductId(productIdParam || urlParam)
+
+    if (!productId) {
+      return c.json({
+        ok: false,
+        error: '상품번호를 찾을 수 없습니다. product_id 또는 번개장터 상품 URL을 입력하세요.',
+        input: { url: urlParam, product_id: productIdParam }
+      }, 400)
+    }
+
+    const config = await c.env.MONITOR_KV.get('config', 'json') as any || {}
+    const myUid = String(config.uid || config.my_uid || config.user_id || '')
+
+    const currentState = await c.env.MONITOR_KV.get('chat_state', 'json') as any || {}
+    const archiveState = await c.env.MONITOR_KV.get('chat_state_archive', 'json') as any || {}
+
+    const normalizeList = (state: any, archived: boolean): any[] => {
+      if (!state) return []
+
+      let raw: any[] = []
+
+      if (Array.isArray(state)) {
+        raw = state
+      } else if (Array.isArray(state.chats)) {
+        raw = state.chats
+      } else if (Array.isArray(state.channels)) {
+        raw = state.channels
+      } else if (Array.isArray(state.recent_chats)) {
+        raw = state.recent_chats
+      } else if (typeof state === 'object') {
+        const values = Object.values(state)
+        const objectValues = values.filter((v: any) => v && typeof v === 'object')
+        raw = objectValues as any[]
+      }
+
+      return raw
+        .filter((x: any) => x && typeof x === 'object')
+        .map((x: any) => ({
+          ...x,
+          archived,
+          channel_id: String(x.channel_id || x.channelId || x.id || ''),
+          other_id: String(x.other_id || x.otherId || x.target_uid || x.targetUid || x.uid || ''),
+          nickname: String(x.nickname || x.nick || x.shop_name || x.shopName || ''),
+          last_message: String(x.last_message || x.lastMessage || x.message || x.text || ''),
+          last_time: x.last_time || x.lastTime || x.updated_at || x.updatedAt || x.created_at || x.createdAt || ''
+        }))
+    }
+
+    const currentChats = normalizeList(currentState, false)
+    const archivedChats = normalizeList(archiveState, true)
+
+    const byKey = new Map<string, any>()
+    for (const chat of [...archivedChats, ...currentChats]) {
+      const key = chat.channel_id || `${chat.other_id}:${chat.last_time}:${chat.last_message}`
+      const prev = byKey.get(key)
+      if (!prev || prev.archived) {
+        byKey.set(key, chat)
+      }
+    }
+
+    const allChats = Array.from(byKey.values())
+
+    const buildSearchText = (chat: any): string => {
+      const parts: string[] = []
+
+      const add = (v: any) => {
+        if (v === undefined || v === null) return
+        if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+          parts.push(String(v))
+        } else if (Array.isArray(v)) {
+          for (const item of v.slice(-50)) add(item)
+        } else if (typeof v === 'object') {
+          for (const key of Object.keys(v)) {
+            if (
+              key.toLowerCase().includes('message') ||
+              key.toLowerCase().includes('product') ||
+              key.toLowerCase().includes('title') ||
+              key.toLowerCase().includes('pid') ||
+              key.toLowerCase().includes('url') ||
+              key.toLowerCase().includes('uid') ||
+              key.toLowerCase().includes('id')
+            ) {
+              add(v[key])
+            }
+          }
+        }
+      }
+
+      add(chat)
+      return parts.join(' ').toLowerCase()
+    }
+
+    // 1차: 기존 KV/아카이브에서 상품번호 직접 검색
+    const directMatches = allChats.filter((chat: any) => {
+      const text = buildSearchText(chat)
+      return text.includes(productId.toLowerCase())
+    })
+
+    // 2차: 번개장터 상품 API들에서 판매자 UID 후보 추출 시도
+    const attemptedUrls: string[] = []
+    const sellerCandidates = new Set<string>()
+    let productApiFound = false
+    let productApiError = ''
+
+    const candidateProductUrls = [
+      `https://api.bunjang.co.kr/api/1/product/${productId}/detail_info.json`,
+      `https://api.bunjang.co.kr/api/1/product/${productId}/detail_info.json?version=2`,
+      `https://m.bunjang.co.kr/api/rec/v3/products/product-detail?pid=${productId}`
+    ]
+
+    const collectSellerIds = (obj: any) => {
+      const visit = (node: any, path: string) => {
+        if (!node || typeof node !== 'object') return
+
+        for (const [k, v] of Object.entries(node)) {
+          const key = String(k).toLowerCase()
+          const nextPath = path ? `${path}.${k}` : String(k)
+
+          if (
+            (
+              key.includes('seller') ||
+              key.includes('shop') ||
+              key.includes('user') ||
+              key === 'uid' ||
+              key.endsWith('_uid') ||
+              key.endsWith('uid')
+            ) &&
+            (typeof v === 'string' || typeof v === 'number')
+          ) {
+            const s = String(v)
+            if (/^\d{4,15}$/.test(s) && s !== productId) {
+              sellerCandidates.add(s)
+            }
+          }
+
+          if (typeof v === 'object') visit(v, nextPath)
+        }
+      }
+
+      visit(obj, '')
+    }
+
+    for (const apiUrl of candidateProductUrls) {
+      attemptedUrls.push(apiUrl)
+
+      try {
+        const res = await fetch(apiUrl, {
+          headers: {
+            'accept': 'application/json, text/plain, */*',
+            'user-agent': 'Mozilla/5.0 VeaslyBunjangMonitor/1.0'
+          }
+        })
+
+        if (!res.ok) {
+          continue
+        }
+
+        const contentType = res.headers.get('content-type') || ''
+        let data: any = null
+
+        if (contentType.includes('application/json')) {
+          data = await res.json()
+        } else {
+          const text = await res.text()
+          try {
+            data = JSON.parse(text)
+          } catch {
+            data = { text }
+          }
+        }
+
+        productApiFound = true
+        collectSellerIds(data)
+      } catch (err: any) {
+        productApiError = err?.message || String(err)
+      }
+    }
+
+    // 3차: 판매자 UID 후보가 있으면 channel_id / other_id 기준으로 검색
+    const sellerIds = Array.from(sellerCandidates)
+
+    const sellerMatches = sellerIds.length > 0
+      ? allChats.filter((chat: any) => {
+          const channelId = String(chat.channel_id || '')
+          const otherId = String(chat.other_id || '')
+          return sellerIds.some((sellerId) =>
+            otherId === sellerId ||
+            channelId.includes(sellerId) ||
+            buildSearchText(chat).includes(sellerId)
+          )
+        })
+      : []
+
+    const merged = new Map<string, any>()
+
+    for (const chat of [...directMatches, ...sellerMatches]) {
+      const key = chat.channel_id || `${chat.other_id}:${chat.last_time}:${chat.last_message}`
+      merged.set(key, {
+        ...chat,
+        match_reason: directMatches.includes(chat)
+          ? 'product_id_in_chat_data'
+          : 'seller_uid_match'
+      })
+    }
+
+    const results = Array.from(merged.values())
+      .sort((a: any, b: any) => {
+        const at = new Date(a.last_time || 0).getTime()
+        const bt = new Date(b.last_time || 0).getTime()
+        return bt - at
+      })
+      .slice(0, limit)
+
+    const reason =
+      results.length > 0
+        ? 'matched'
+        : sellerIds.length > 0
+          ? 'seller_uid_found_but_no_chat_match'
+          : productApiFound
+            ? 'product_api_found_but_seller_uid_not_found'
+            : 'product_api_not_found_or_unavailable'
+
+    return c.json({
+      ok: true,
+      product_id: productId,
+      count: results.length,
+      chats: results,
+      my_uid: myUid,
+      seller_candidates: sellerIds,
+      product_api_found: productApiFound,
+      attempted_urls: attemptedUrls,
+      product_api_error: productApiError || null,
+      reason,
+      note: results.length === 0
+        ? '상품이 삭제/비공개/오래된 거래이면 번장 API에서 판매자 UID를 못 주거나, 기존 KV/아카이브에 상품번호가 없어 매칭이 안 될 수 있습니다.'
+        : ''
+    })
+  } catch (error: any) {
+    return c.json({
+      ok: false,
+      error: error?.message || String(error)
+    }, 500)
+  }
+})
+
+
+
+
+// 딥 검색 v5.2: recent-chats 기반 안정 검색 + offset + 메시지 본문 검색
+app.get('/api/deep-search-chats', async (c) => {
+  try {
+    const rawQuery =
+      c.req.query('q') ||
+      c.req.query('query') ||
+      c.req.query('product_id') ||
+      c.req.query('pid') ||
+      c.req.query('url') ||
+      ''
+
+    const decodedQuery = (() => {
+      try {
+        return decodeURIComponent(rawQuery)
+      } catch {
+        return rawQuery
+      }
+    })().trim()
+
+    const scanLimitRaw = parseInt(c.req.query('limit') || '100', 10)
+    const messageLimitRaw = parseInt(c.req.query('message_limit') || '100', 10)
+    const fetchLimitRaw = parseInt(c.req.query('fetch_limit') || '40', 10)
+    const offsetRaw = parseInt(c.req.query('offset') || '0', 10)
+    const resultLimitRaw = parseInt(c.req.query('result_limit') || '100', 10)
+
+    const scanLimit = Math.min(Math.max(isNaN(scanLimitRaw) ? 100 : scanLimitRaw, 1), 300)
+    const messageLimit = Math.min(Math.max(isNaN(messageLimitRaw) ? 100 : messageLimitRaw, 1), 100)
+    const fetchLimit = Math.min(Math.max(isNaN(fetchLimitRaw) ? 40 : fetchLimitRaw, 0), 40)
+    const offset = Math.min(Math.max(isNaN(offsetRaw) ? 0 : offsetRaw, 0), 1000)
+    const resultLimit = Math.min(Math.max(isNaN(resultLimitRaw) ? 100 : resultLimitRaw, 1), 300)
+
+    const extractProductId = (input: string): string => {
+      if (!input) return ''
+      const fromUrl = input.match(/\/products\/(\d+)/)
+      if (fromUrl && fromUrl[1]) return fromUrl[1]
+      const numeric = input.match(/\b(\d{6,15})\b/)
+      if (numeric && numeric[1]) return numeric[1]
+      return ''
+    }
+
+    const productId = extractProductId(decodedQuery)
+
+    if (!decodedQuery && !productId) {
+      return c.json({
+        ok: false,
+        error: '검색어가 없습니다. q, product_id 또는 url을 입력하세요.',
+        reason: 'empty_query'
+      })
+    }
+
+    const queryTerms = Array.from(new Set([
+      decodedQuery,
+      productId
+    ].filter(Boolean).map((x) => String(x).toLowerCase())))
+
+    const origin = new URL(c.req.url).origin
+
+    const normalizeText = (value: any): string => {
+      return String(value || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase()
+    }
+
+    const stringifyDeep = (value: any, depth = 0): string => {
+      if (value === undefined || value === null) return ''
+      if (depth > 6) return ''
+
+      if (
+        typeof value === 'string' ||
+        typeof value === 'number' ||
+        typeof value === 'boolean'
+      ) {
+        return String(value)
+      }
+
+      if (Array.isArray(value)) {
+        return value.slice(-100).map((x) => stringifyDeep(x, depth + 1)).join(' ')
+      }
+
+      if (typeof value === 'object') {
+        const parts: string[] = []
+
+        for (const [key, val] of Object.entries(value)) {
+          const k = String(key).toLowerCase()
+
+          if (
+            depth <= 2 ||
+            k.includes('message') ||
+            k.includes('text') ||
+            k.includes('body') ||
+            k.includes('content') ||
+            k.includes('msg') ||
+            k.includes('product') ||
+            k.includes('title') ||
+            k.includes('name') ||
+            k.includes('pid') ||
+            k.includes('url') ||
+            k.includes('uid') ||
+            k.includes('id') ||
+            k.includes('nickname')
+          ) {
+            parts.push(String(key))
+            parts.push(stringifyDeep(val, depth + 1))
+          }
+        }
+
+        return parts.join(' ')
+      }
+
+      return ''
+    }
+
+    const isMatch = (text: string): boolean => {
+      const lower = normalizeText(text)
+      return queryTerms.some((term) => term && lower.includes(term))
+    }
+
+    const makeSnippet = (text: string): string => {
+      const normalized = String(text || '').replace(/\s+/g, ' ').trim()
+      if (!normalized) return ''
+
+      const lower = normalized.toLowerCase()
+      let idx = -1
+
+      for (const term of queryTerms) {
+        idx = lower.indexOf(term)
+        if (idx >= 0) break
+      }
+
+      if (idx < 0) return normalized.slice(0, 180)
+
+      const start = Math.max(0, idx - 70)
+      const end = Math.min(normalized.length, idx + 140)
+
+      return normalized.slice(start, end)
+    }
+
+    const safeChat = (chat: any): any => {
+      return {
+        channel_id: String(chat.channel_id || chat.channelId || ''),
+        other_id: String(chat.other_id || chat.otherId || chat.target_uid || chat.targetUid || ''),
+        nickname: String(chat.nickname || chat.nick || chat.shop_name || chat.shopName || ''),
+        last_message: String(chat.last_message || chat.lastMessage || chat.message || ''),
+        last_time: chat.last_time || chat.lastTime || chat.updated_at || chat.updatedAt || '',
+        archived: Boolean(chat.archived || chat.is_archived || false),
+        is_filtered: Boolean(chat.is_filtered || false),
+        needs_reply: Boolean(chat.needs_reply || false)
+      }
+    }
+
+    // 1단계: 검증된 recent-chats API에서 정규화된 채팅 목록 확보
+    const recentUrl = origin + '/api/recent-chats?limit=' + scanLimit
+    const recentRes = await fetch(recentUrl, {
+      headers: {
+        accept: 'application/json'
+      }
+    })
+
+    if (!recentRes.ok) {
+      return c.json({
+        ok: false,
+        error: 'recent-chats 조회 실패',
+        status: recentRes.status,
+        reason: 'recent_chats_fetch_failed'
+      })
+    }
+
+    const recentData = await recentRes.json() as any
+    const recentChatsRaw = Array.isArray(recentData.chats) ? recentData.chats : []
+    const allChats = recentChatsRaw.map(safeChat).filter((chat: any) => chat.channel_id)
+
+    const resultsMap = new Map<string, any>()
+    const errors: any[] = []
+
+    let summaryMatches = 0
+    let fetchedChannels = 0
+    let messageMatches = 0
+
+    // 2단계: 요약 필드 검색
+    for (const chat of allChats) {
+      const summaryText = [
+        chat.channel_id,
+        chat.other_id,
+        chat.nickname,
+        chat.last_message,
+        chat.last_time
+      ].join(' ')
+
+      if (isMatch(summaryText)) {
+        summaryMatches += 1
+
+        resultsMap.set(chat.channel_id, {
+          ...chat,
+          match_reason: 'summary_match',
+          summary_snippet: makeSnippet(summaryText),
+          matched_messages: [],
+          matched_message_count: 0,
+          message_fetch_status: 'not_needed'
+        })
+      }
+    }
+
+    // 3단계: offset 적용 후 메시지 본문 검색
+    const fetchTargets = allChats
+      .filter((chat: any) => chat.channel_id)
+      .slice(offset, offset + fetchLimit)
+
+    const fetchMessagesForChat = async (chat: any) => {
+      const channelId = String(chat.channel_id || '')
+      if (!channelId) return
+
+      let timer: any = null
+
+      try {
+        const controller = new AbortController()
+
+        timer = setTimeout(() => {
+          try {
+            controller.abort()
+          } catch {}
+        }, 3000)
+
+        const messageUrl =
+          origin +
+          '/api/messages/' +
+          encodeURIComponent(channelId) +
+          '?limit=' +
+          messageLimit
+
+        const res = await fetch(messageUrl, {
+          headers: {
+            accept: 'application/json'
+          },
+          signal: controller.signal
+        })
+
+        if (!res.ok) {
+          errors.push({
+            channel_id: channelId,
+            status: res.status,
+            error: 'message_fetch_not_ok'
+          })
+          return
+        }
+
+        fetchedChannels += 1
+
+        const data = await res.json() as any
+
+        const messages = Array.isArray(data.messages)
+          ? data.messages
+          : Array.isArray(data.data)
+            ? data.data
+            : Array.isArray(data.result)
+              ? data.result
+              : Array.isArray(data)
+                ? data
+                : []
+
+        const matchedMessages: any[] = []
+
+        for (const msg of messages.slice(-messageLimit)) {
+          const msgText = stringifyDeep(msg)
+
+          if (isMatch(msgText)) {
+            matchedMessages.push({
+              snippet: makeSnippet(msgText),
+              raw_text: String(
+                msg.message ||
+                msg.text ||
+                msg.body ||
+                msg.content ||
+                msg.message_text ||
+                msg.msg ||
+                ''
+              ).slice(0, 500),
+              created_at: msg.created_at || msg.createdAt || msg.timestamp || msg.time || '',
+              sender_id: msg.sender_id || msg.senderId || msg.uid || ''
+            })
+
+            if (matchedMessages.length >= 5) break
+          }
+        }
+
+        if (matchedMessages.length > 0) {
+          messageMatches += 1
+
+          const prev = resultsMap.get(channelId)
+
+          resultsMap.set(channelId, {
+            ...chat,
+            match_reason: prev ? prev.match_reason + '+message_match' : 'message_match',
+            summary_snippet: prev ? prev.summary_snippet : makeSnippet([
+              chat.channel_id,
+              chat.other_id,
+              chat.nickname,
+              chat.last_message
+            ].join(' ')),
+            matched_messages: matchedMessages,
+            matched_message_count: matchedMessages.length,
+            message_fetch_status: String(res.status)
+          })
+        }
+      } catch (err: any) {
+        errors.push({
+          channel_id: channelId,
+          error: err?.message || String(err)
+        })
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+    }
+
+    for (let i = 0; i < fetchTargets.length; i += 5) {
+      const batch = fetchTargets.slice(i, i + 5)
+      await Promise.all(batch.map((chat: any) => fetchMessagesForChat(chat)))
+    }
+
+    const results = Array.from(resultsMap.values())
+      .sort((a: any, b: any) => {
+        const at = new Date(a.last_time || 0).getTime()
+        const bt = new Date(b.last_time || 0).getTime()
+        return bt - at
+      })
+      .slice(0, resultLimit)
+
+    const reason =
+      results.length > 0
+        ? 'matched'
+        : productId
+          ? 'no_match_after_deep_search_for_product_id'
+          : 'no_match_after_deep_search'
+
+    return c.json({
+      ok: true,
+      query: decodedQuery,
+      product_id: productId || null,
+      query_terms: queryTerms,
+      count: results.length,
+      chats: results,
+      scanned_channels: allChats.length,
+      offset: offset,
+      fetch_targets: fetchTargets.length,
+      fetched_channels: fetchedChannels,
+      summary_matches: summaryMatches,
+      message_matches: messageMatches,
+      reason,
+      errors: errors.slice(0, 10),
+      source: 'recent-chats',
+      note: results.length === 0
+        ? 'recent-chats 목록과 조회 가능한 최근 메시지에서 검색어를 찾지 못했습니다.'
+        : ''
+    })
+  } catch (error: any) {
+    return c.json({
+      ok: false,
+      error: error?.message || String(error),
+      reason: 'deep_search_internal_error_v52'
+    })
+  }
+})
+
 app.get('/api/recent-chats', async (c) => {
   const state: any = await c.env.MONITOR_KV.get('chat_state', 'json') || { known: {} }
   const nicknameCache: any = await c.env.MONITOR_KV.get('nickname_cache', 'json') || {}
   const config: any = await c.env.MONITOR_KV.get('config', 'json') || {}
   const ignoreKeywords: string[] = config.ignore_keywords || []
+  const requestedLimit = Number(c.req.query('limit') || '300')
+  const limit = Math.min(Math.max(Number.isFinite(requestedLimit) ? requestedLimit : 300, 1), 500)
 
   const chats = Object.entries(state.known || {})
     .map(([channelId, data]: [string, any]) => {
@@ -329,7 +1043,7 @@ app.get('/api/recent-chats', async (c) => {
       }
     })
     .sort((a, b) => (b.last_time || '').localeCompare(a.last_time || ''))
-    .slice(0, 50)
+    .slice(0, limit)
 
   return c.json({
     ok: true,
@@ -464,9 +1178,18 @@ app.get('/api/nicknames', async (c) => {
 
 // 상태 초기화
 app.post('/api/reset', async (c) => {
-  await c.env.MONITOR_KV.delete('chat_state')
-  await c.env.MONITOR_KV.delete('nickname_cache')
-  return c.json({ ok: true, message: '채팅 상태 초기화됨' })
+  // 운영 데이터 보호: 실수로 기존 채팅 상태가 삭제되는 것을 방지한다.
+  // 필요 시 Cloudflare KV 백업 후 관리자 전용 임시 스크립트로만 초기화한다.
+  return c.json({
+    ok: false,
+    error: 'Reset is disabled in production to protect existing chat data.',
+  }, 403)
 })
 
 export default app
+
+
+
+
+
+
