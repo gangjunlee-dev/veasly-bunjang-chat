@@ -365,7 +365,41 @@ let G = {
 function isProductSearchQuery(q) {
   if (!q) return false;
   var text = String(q).trim();
-  return /\/products\/\d+/.test(text) || /^\d{6,15}$/.test(text);
+
+  // 1) 숫자만 6~15자리면 상품번호로 판단
+  var n = text.length;
+  if (n >= 6 && n <= 15) {
+    var allDigits = true;
+    for (var i = 0; i < n; i++) {
+      var code = text.charCodeAt(i);
+      if (code < 48 || code > 57) {
+        allDigits = false;
+        break;
+      }
+    }
+    if (allDigits) return true;
+  }
+
+  // 2) 번개장터 상품 URL: /products/ 뒤에 숫자가 있으면 상품 URL로 판단
+  var marker = '/products/';
+  var pos = text.indexOf(marker);
+  if (pos >= 0) {
+    var rest = text.slice(pos + marker.length);
+    var digitCount = 0;
+
+    for (var j = 0; j < rest.length; j++) {
+      var code2 = rest.charCodeAt(j);
+      if (code2 >= 48 && code2 <= 57) {
+        digitCount++;
+      } else {
+        break;
+      }
+    }
+
+    return digitCount >= 6 && digitCount <= 15;
+  }
+
+  return false;
 }
 
 function buildSearchApiUrl(q) {
@@ -966,6 +1000,8 @@ setInterval(() => { loadStatus(); loadChats(); }, 30000);
 </script>
 </body>
 </html>`;
+
+
 
 
 
