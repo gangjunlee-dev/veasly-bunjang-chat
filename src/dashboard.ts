@@ -695,14 +695,56 @@ function toggleFilter(mode) {
   renderChatList();
 }
 
+
+function clearSearchAndLoad() {
+  var input = document.getElementById('search-input');
+  if (input) input.value = '';
+
+  G.searchQuery = '';
+  G.serverSearchMode = false;
+  G.searchMeta = null;
+
+  loadChats();
+}
 function renderChatList() {
   const el = document.getElementById('chat-list-area');
   if (!G.chats.length) {
-    el.innerHTML = '<div class="no-results"><i class="fas fa-inbox"></i>채팅이 없습니다. 수동 폴링을 실행하세요.</div>';
-    document.getElementById('filter-count').textContent = '';
+    var countEl = document.getElementById('filter-count');
+    if (countEl) countEl.textContent = '';
+
+    if (G.searchQuery || G.serverSearchMode) {
+      var metaHtml = '';
+
+      if (G.searchQuery) {
+        metaHtml += '<div style="font-size:12px;margin-top:6px;color:#64748b">검색어: <strong>' + escH(G.searchQuery) + '</strong></div>';
+      }
+
+      if (G.searchMeta && G.searchMeta.type === 'product') {
+        metaHtml += '<div style="font-size:11px;margin-top:6px;color:#94a3b8">상품번호/URL 딥서치 결과가 없습니다.</div>';
+      } else {
+        metaHtml += '<div style="font-size:11px;margin-top:6px;color:#94a3b8">닉네임, UID, 마지막 메시지에서 일치 항목이 없습니다.</div>';
+      }
+
+      el.innerHTML =
+        '<div class="no-results">' +
+        '<i class="fas fa-search"></i>' +
+        '<div style="font-weight:800;margin-top:8px">검색 결과가 없습니다</div>' +
+        metaHtml +
+        '<button style="margin-top:12px;padding:7px 12px;border-radius:999px;border:1px solid #fed7aa;background:#fff7ed;color:#f97316;font-size:12px;font-weight:800;cursor:pointer" onclick="clearSearchAndLoad()">' +
+        '<i class="fas fa-rotate-left"></i> 검색 초기화' +
+        '</button>' +
+        '</div>';
+      return;
+    }
+
+    el.innerHTML =
+      '<div class="no-results">' +
+      '<i class="fas fa-inbox"></i>' +
+      '<div style="font-weight:800;margin-top:8px">채팅이 없습니다</div>' +
+      '<div style="font-size:12px;margin-top:6px;color:#94a3b8">수동 폴링을 실행하거나 잠시 후 다시 확인하세요.</div>' +
+      '</div>';
     return;
   }
-
   // 필터링 적용
   let visible = G.chats;
 
@@ -1000,6 +1042,8 @@ setInterval(() => { loadStatus(); loadChats(); }, 30000);
 </script>
 </body>
 </html>`;
+
+
 
 
 
