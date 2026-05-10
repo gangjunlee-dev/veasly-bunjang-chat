@@ -372,7 +372,7 @@ function buildSearchApiUrl(q) {
   var text = String(q || '').trim();
 
   if (isProductSearchQuery(text)) {
-    return '/api/deep-search-chats?q=' + encodeURIComponent(text) + '&limit=91&message_limit=100&fetch_limit=40&offset=0';
+    return '/api/deep-search-chats?q=' + encodeURIComponent(text) + '&limit=300&message_limit=100&fetch_limit=40&offset=0';
   }
 
   return '/api/search-chats?q=' + encodeURIComponent(text) + '&limit=300';
@@ -462,156 +462,193 @@ window.onSearch = function() {
 
 async function runServerSearch() {
   try {
-    const rawInput = (document.getElementById('search-input').value || '').trim();
-    const inputValue = rawInput.toLowerCase();
+    var inputEl = document.getElementById('search-input');
+    var rawInput = String((inputEl && inputEl.value) || '').trim();
+    var area = document.getElementById('chat-list-area');
 
-    if (!inputValue) {
+    if (!rawInput) {
       G.serverSearchMode = false;
       G.searchMeta = null;
       await loadChats();
       return;
     }
 
-    // 상품번호/상품 URL은 3구간 자동 딥서치
+    // 상품번호/상품 URL은 현재 recent-chats 개수를 기준으로 전체 구간 자동 딥서치
     if (isProductSearchQuery(rawInput)) {
-      const area = document.getElementById('chat-list-area');
-      const countEl = document.getElementById('filter-count');
-
       G.serverSearchMode = true;
       G.searchMeta = {
-        type: 'product_deep_search',
+        type: 'product',
         query: rawInput,
-        scanned: 0,
-        fetched: 0,
-        matches: 0
+        loading: true
       };
 
-      const offsets = [0, 40, 80];
-      const merged = {};
-      let totalFetched = 0;
-      let totalTargets = 0;
-      let totalScanned = 0;
-      let totalErrors = [];
-
-      area.innerHTML =
-        '<div class="no-results">' +
-        '<i class="fas fa-spinner fa-spin"></i>' +
-        '<div style="font-weight:700;color:#475569">상품번호 딥서치 중...</div>' +
-        '<div style="font-size:12px;margin-top:6px">최근 채팅방과 메시지를 확인하고 있습니다.</div>' +
-        '</div>';
-
-      for (let i = 0; i < offsets.length; i++) {
-        const offset = offsets[i];
-
+      if (area) {
         area.innerHTML =
-          '<div class="no-results">' +
+          '<div style="padding:32px;text-align:center;color:#64748b">' +
           '<i class="fas fa-spinner fa-spin"></i>' +
-          '<div style="font-weight:700;color:#475569">상품번호 딥서치 중...</div>' +
-          '<div style="font-size:12px;margin-top:6px">구간 ' + (i + 1) + '/3 · offset=' + offset + '</div>' +
-          '<div style="font-size:11px;margin-top:4px;color:#94a3b8">검색어: ' + esc(rawInput) + '</div>' +
+          '<div style="font-weight:700;color:#475569;margin-top:8px">상품번호 딥서치 준비 중...</div>' +
+          '<div style="font-size:12px;margin-top:6px">최근 채팅방 수를 확인하고 있습니다.</div>' +
           '</div>';
+      }
 
-        const url =
+      var fetchLimit = 40;
+      var messageLimit = 100;
+      var totalChannels = 0;
+
+      try {
+        var recent = await api('/api/recent-chats?limit=300');
+        if (recent && recent.ok && recent.chats && typeof recent.chats.length === 'number') {
+          totalChannels = recent.chats.length;
+        }
+      } catch (recentErr) {
+        console.warn('recent-chats count check failed', recentErr);
+      }
+
+      // fallback: recent count를 못 가져오면 기존보다 넉넉하게 300 기준으로 조회
+      if (!totalChannels || totalChannels < 1) {
+        totalChannels = 300;
+      }
+
+      var offsets = [];
+      for (var off = 0; off < totalChannels; off += fetchLimit) {
+        offsets.push(off);
+      }
+      if (!offsets.length) offsets.push(0);
+
+      var merged = {};
+      var totalFetched = 0;
+      var totalMessageMatches = 0;
+      var totalSummaryMatches = 0;
+      var maxScanned = 0;
+      var errors = [];
+
+      for (var i = 0; i < offsets.length; i++) {
+        var offset = offsets[i];
+
+        if (area) {
+          area.innerHTML =
+            '<div style="padding:32px;text-align:center;color:#64748b">' +
+            '<i class="fas fa-spinner fa-spin"></i>' +
+            '<div style="font-weight:700;color:#475569;margin-top:8px">상품번호 딥서치 중...</div>' +
+            '<div style="font-size:12px;margin-top:6px">구간 ' + (i + 1) + '/' + offsets.length + ' · offset=' + offset + '</div>' +
+            '<div style="font-size:11px;margin-top:4px;color:#94a3b8">검색어: ' + esc(rawInput) + '</div>' +
+            '<div style="font-size:11px;margin-top:4px;color:#94a3b8">대상 채팅방: 약 ' + totalChannels + '개 · 구간당 최대 ' + fetchLimit + '개</div>' +
+            '</div>';
+        }
+
+        var url =
           '/api/deep-search-chats?q=' +
           encodeURIComponent(rawInput) +
-          '&limit=91&message_limit=100&fetch_limit=40&offset=' +
-          offset;
+          '&limit=' + encodeURIComponent(String(totalChannels)) +
+          '&message_limit=' + encodeURIComponent(String(messageLimit)) +
+          '&fetch_limit=' + encodeURIComponent(String(fetchLimit)) +
+          '&offset=' + encodeURIComponent(String(offset));
 
-        const data = await api(url);
+        var data = await api(url);
 
-        const currentValue = (document.getElementById('search-input').value || '').trim();
-        if (currentValue !== rawInput) return;
-
-        if (data && data.ok) {
-          totalFetched += Number(data.fetched_channels || 0);
-          totalTargets += Number(data.fetch_targets || 0);
-          totalScanned = Math.max(totalScanned, Number(data.scanned_channels || 0));
-
-          if (Array.isArray(data.errors)) {
-            totalErrors = totalErrors.concat(data.errors);
-          }
-
-          (data.chats || []).forEach(function(c) {
-            const key = c.channel_id || c.other_id || (c.nickname + ':' + c.last_time);
-            merged[key] = c;
+        if (!data || data.ok === false) {
+          errors.push({
+            offset: offset,
+            error: data && data.error ? data.error : 'deep_search_failed'
           });
+          continue;
+        }
+
+        maxScanned = Math.max(maxScanned, Number(data.scanned_channels || 0));
+        totalFetched += Number(data.fetched_channels || 0);
+        totalMessageMatches += Number(data.message_matches || 0);
+        totalSummaryMatches += Number(data.summary_matches || 0);
+
+        if (data.errors && data.errors.length) {
+          for (var e = 0; e < data.errors.length; e++) {
+            errors.push(data.errors[e]);
+          }
+        }
+
+        var chats = data.chats || [];
+        for (var c = 0; c < chats.length; c++) {
+          var chat = chats[c];
+          if (chat && chat.channel_id) {
+            merged[chat.channel_id] = chat;
+          }
         }
       }
 
-      const results = Object.keys(merged).map(function(k) { return merged[k]; });
+      var resultChats = Object.keys(merged).map(function(k) { return merged[k]; });
+      resultChats.sort(function(a, b) {
+        return new Date(b.last_time || 0).getTime() - new Date(a.last_time || 0).getTime();
+      });
 
-      G.chats = results;
-      G.searchQuery = inputValue;
+      G.chats = resultChats;
       G.serverSearchMode = true;
       G.searchMeta = {
-        type: 'product_deep_search',
+        type: 'product',
         query: rawInput,
-        scanned: totalScanned,
-        fetched: totalFetched,
-        targets: totalTargets,
-        matches: results.length,
-        errors: totalErrors
+        totalChannels: totalChannels,
+        scannedChannels: maxScanned || totalChannels,
+        fetchedChannels: totalFetched,
+        summaryMatches: totalSummaryMatches,
+        messageMatches: totalMessageMatches,
+        errors: errors,
+        offsets: offsets
       };
 
-      if (countEl) {
-        countEl.textContent =
-          '딥서치 ' + totalFetched + '개 확인 · 결과 ' + results.length + '개';
+      if (resultChats.length > 0) {
+        renderChatList();
+        return;
       }
 
-      if (!results.length) {
+      if (area) {
         area.innerHTML =
-          '<div class="no-results">' +
-          '<i class="fas fa-search"></i>' +
+          '<div style="padding:28px;text-align:center;color:#64748b">' +
+          '<i class="fas fa-search" style="font-size:26px;color:#cbd5e1;margin-bottom:10px"></i>' +
           '<div style="font-weight:800;color:#475569;margin-bottom:6px">상품번호 검색 결과 없음</div>' +
           '<div style="font-size:12px;line-height:1.8;color:#64748b">' +
           '검색어: <strong>' + esc(rawInput) + '</strong><br>' +
-          '확인 범위: 최근 채팅방 ' + totalScanned + '개<br>' +
-          '메시지 조회: ' + totalFetched + '개 채팅방<br>' +
-          '각 방 최근 메시지 최대 100개<br>' +
+          '확인한 채팅방: <strong>' + esc(String(maxScanned || totalChannels)) + '</strong>개<br>' +
+          '본문 조회 완료: <strong>' + esc(String(totalFetched)) + '</strong>개<br>' +
+          '메시지 범위: 각 채팅방 최근 <strong>' + esc(String(messageLimit)) + '</strong>개<br>' +
+          '조회 구간: <strong>' + esc(String(offsets.length)) + '</strong>개<br>' +
+          '오류: <strong>' + esc(String(errors.length)) + '</strong>개' +
           '</div>' +
           '<div style="font-size:12px;margin-top:10px;color:#f97316;font-weight:700">' +
           '현재 저장된 채팅 데이터 안에는 해당 상품번호/URL이 없습니다.' +
           '</div>' +
           '<div style="font-size:11px;margin-top:6px;color:#94a3b8">' +
-          '상품명, 구매자 닉네임, 판매자명으로 다시 검색해보세요.' +
+          '상품명, 판매자 닉네임, 구매자 닉네임 또는 대화 내 고유 키워드로 다시 검색해 주세요.' +
           '</div>' +
           '</div>';
-        return;
       }
 
-      renderChatList();
       return;
     }
 
-    // 일반 검색은 서버 검색 API 사용
-    const data = await api('/api/search-chats?q=' + encodeURIComponent(inputValue) + '&limit=300');
-    if (!data.ok) return;
+    // 일반 검색어는 기존 서버 검색 사용
+    var data2 = await api('/api/search-chats?q=' + encodeURIComponent(rawInput) + '&limit=300');
 
-    const currentValue = (document.getElementById('search-input').value || '').trim().toLowerCase();
-    if (currentValue !== inputValue) return;
+    if (!data2 || data2.ok === false) {
+      throw new Error(data2 && data2.error ? data2.error : 'search_failed');
+    }
 
+    G.chats = data2.chats || [];
     G.serverSearchMode = true;
     G.searchMeta = {
-      type: 'normal_search',
+      type: 'text',
       query: rawInput,
-      matches: (data.chats || []).length
+      count: G.chats.length
     };
 
-    G.chats = data.chats || [];
-    G.myUid = data.my_uid || G.myUid;
-    G.replyEnabled = data.reply_enabled;
-    G.ignoreKeywords = data.ignore_keywords || G.ignoreKeywords || [];
-
     renderChatList();
-  } catch(e) {
-    console.error(e);
-    const area = document.getElementById('chat-list-area');
-    if (area) {
-      area.innerHTML =
-        '<div class="no-results">' +
-        '<i class="fas fa-exclamation-triangle"></i>' +
-        '<div style="font-weight:700;color:#dc2626">검색 중 오류가 발생했습니다</div>' +
-        '<div style="font-size:12px;margin-top:6px;color:#94a3b8">' + esc(e.message || String(e)) + '</div>' +
+  } catch (err) {
+    console.error('runServerSearch failed', err);
+
+    var area2 = document.getElementById('chat-list-area');
+    if (area2) {
+      area2.innerHTML =
+        '<div style="padding:24px;text-align:center;color:#ef4444">' +
+        '<i class="fas fa-triangle-exclamation"></i>' +
+        '<div style="font-weight:700;margin-top:8px">검색 중 오류가 발생했습니다.</div>' +
+        '<div style="font-size:12px;margin-top:6px;color:#991b1b">' + esc(String(err && err.message ? err.message : err)) + '</div>' +
         '</div>';
     }
   }
@@ -929,6 +966,8 @@ setInterval(() => { loadStatus(); loadChats(); }, 30000);
 </script>
 </body>
 </html>`;
+
+
 
 
 
